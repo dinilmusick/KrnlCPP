@@ -8,4 +8,8 @@ if(BUILD_TESTING)
   add_executable(krnlcpp_lifecycle_test tests/lifecycle_test.cpp)
   target_link_libraries(krnlcpp_lifecycle_test PRIVATE krnlcpp)
   add_test(NAME krnlcpp_lifecycle COMMAND krnlcpp_lifecycle_test)
+
+  add_executable(krnlcpp_lifecycle_matrix_test tests/lifecycle_matrix_test.cpp)
+  target_link_libraries(krnlcpp_lifecycle_matrix_test PRIVATE krnlcpp)
+  add_test(NAME krnlcpp_lifecycle_matrix COMMAND krnlcpp_lifecycle_matrix_test)
 endif()
