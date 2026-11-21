@@ -25,7 +25,7 @@
 #include <vector>
 
 namespace krnl {
-enum class ErrorCode { invalid_argument, invalid_state, not_found, duplicate, type_mismatch, cancelled, queue_full, exhausted, transport, exception, disposed, invalid_graph };
+enum class ErrorCode { invalid_argument, invalid_state, not_found, duplicate, type_mismatch, cancelled, queue_full, exhausted, transport, exception, disposed, invalid_graph, timeout };
 struct Error { ErrorCode code; std::string message; bool retryable=false; };
 template<class T> class Result {
   std::variant<T,Error> data_;
@@ -58,9 +58,25 @@ class Cancellation {
 };
 struct OperationInfo {std::string name,description;std::vector<std::string> capabilities,protocols;std::type_index input{typeid(void)},output{typeid(void)};};
 struct ServiceInfo { std::string id,name,version;std::vector<std::string> capabilities,protocols;};
-inline Result<void> validate(const ServiceInfo& info){
- if(info.id.empty()||info.name.empty()||info.version.empty())return failure(ErrorCode::invalid_argument,"service identity/name/version required");
+inline bool known_protocol(const std::string& p){
+ static const char* const allowed[]={"http","https","ws","wss","udp","p2p","signaling","memory"};
+ for(auto candidate:allowed)if(p==candidate)return true;
+ return false;
+}
+inline Result<void> validate_labels(const std::vector<std::string>& values,bool protocols){
+ for(std::size_t i=0;i<values.size();++i){
+  if(values[i].empty()||(protocols&&!known_protocol(values[i])))
+   return failure(ErrorCode::invalid_argument,"empty or unsupported capability/protocol");
+  for(std::size_t k=0;k<i;++k)if(values[k]==values[i])
+   return failure(ErrorCode::duplicate,"duplicate capability/protocol");
+ }
  return {};
+}
+inline Result<void> validate(const ServiceInfo& info){
+ if(info.id.empty()||info.name.empty()||info.version.empty())
+  return failure(ErrorCode::invalid_argument,"service identity/name/version required");
+ auto capabilities=validate_labels(info.capabilities,false);if(!capabilities.ok())return capabilities;
+ return validate_labels(info.protocols,true);
 }
 struct InvocationTrace {std::uint64_t id=0;std::string service,operation,correlation_id;bool success=false;ErrorCode code=ErrorCode::exception;};
 class TraceBuffer {
@@ -102,7 +118,7 @@ class Service {
  using Handler=std::function<Result<std::any>(const std::any&,const InvocationContext&,Cancellation)>;
  struct Operation {OperationInfo info;Handler handler;};
  ServiceInfo info_;LifecycleHooks hooks_;
- mutable std::mutex mutex_;std::condition_variable idle_;Lifecycle lifecycle_;bool disposed_=false;std::size_t in_flight_=0;
+ mutable std::mutex mutex_;std::condition_variable idle_;Lifecycle lifecycle_;bool disposed_=false,disposing_=false;std::size_t in_flight_=0;
  std::map<std::string,Operation> operations_;std::atomic<std::uint64_t> sequence_{0};TraceBuffer traces_;EventBus events_;StateStore state_;
  static Result<void> run_hook(const std::function<void()>& hook){try{if(hook)hook();return {};}catch(const std::exception& e){return failure(ErrorCode::exception,e.what());}catch(...){return failure(ErrorCode::exception,"unknown hook failure");}}
  public:
@@ -115,15 +131,37 @@ class Service {
  EventBus& events()noexcept{return events_;}
  StateStore& state()noexcept{return state_;}
  std::vector<InvocationTrace> traces()const{return traces_.snapshot();}
- Result<void> initialize(){std::unique_lock<std::mutex> lock(mutex_);if(disposed_)return failure(ErrorCode::disposed,"service disposed");if(lifecycle_.state()!=LifecycleState::uninitialized)return failure(ErrorCode::invalid_state,"initialize requires uninitialized");auto valid=validate(info_);if(!valid.ok())return valid;lifecycle_.apply(LifecycleEvent::initialize);lock.unlock();auto r=run_hook(hooks_.on_init);lock.lock();lifecycle_.apply(r.ok()?LifecycleEvent::initialized:LifecycleEvent::initialization_failed);return r;}
- Result<void> start(){std::unique_lock<std::mutex> lock(mutex_);if(disposed_)return failure(ErrorCode::disposed,"service disposed");if(lifecycle_.state()==LifecycleState::running)return {};if(lifecycle_.state()!=LifecycleState::ready&&lifecycle_.state()!=LifecycleState::stopped)return failure(ErrorCode::invalid_state,"start requires ready or stopped");lifecycle_.apply(LifecycleEvent::start);lock.unlock();auto r=run_hook(hooks_.on_start);lock.lock();lifecycle_.apply(r.ok()?LifecycleEvent::started:LifecycleEvent::start_failed);return r;}
- Result<void> stop(){std::unique_lock<std::mutex> lock(mutex_);if(disposed_)return failure(ErrorCode::disposed,"service disposed");if(lifecycle_.state()==LifecycleState::stopped)return {};if(lifecycle_.state()!=LifecycleState::running)return failure(ErrorCode::invalid_state,"stop requires running");lifecycle_.apply(LifecycleEvent::stop);idle_.wait(lock,[this]{return in_flight_==0;});lock.unlock();auto r=run_hook(hooks_.on_stop);lock.lock();lifecycle_.apply(r.ok()?LifecycleEvent::stopped:LifecycleEvent::stop_failed);return r;}
+ Result<void> initialize(){std::unique_lock<std::mutex> lock(mutex_);if(disposed_||disposing_)return failure(ErrorCode::disposed,"service disposed");if(lifecycle_.state()!=LifecycleState::uninitialized)return failure(ErrorCode::invalid_state,"initialize requires uninitialized");auto valid=validate(info_);if(!valid.ok())return valid;lifecycle_.apply(LifecycleEvent::initialize);lock.unlock();auto r=run_hook(hooks_.on_init);lock.lock();lifecycle_.apply(r.ok()?LifecycleEvent::initialized:LifecycleEvent::initialization_failed);lock.unlock();idle_.notify_all();return r;}
+ Result<void> start(){std::unique_lock<std::mutex> lock(mutex_);if(disposed_||disposing_)return failure(ErrorCode::disposed,"service disposed");if(lifecycle_.state()==LifecycleState::running)return {};if(lifecycle_.state()!=LifecycleState::ready&&lifecycle_.state()!=LifecycleState::stopped)return failure(ErrorCode::invalid_state,"start requires ready or stopped");lifecycle_.apply(LifecycleEvent::start);lock.unlock();auto r=run_hook(hooks_.on_start);lock.lock();lifecycle_.apply(r.ok()?LifecycleEvent::started:LifecycleEvent::start_failed);lock.unlock();idle_.notify_all();return r;}
+ Result<void> stop(){std::unique_lock<std::mutex> lock(mutex_);if(disposed_)return failure(ErrorCode::disposed,"service disposed");if(lifecycle_.state()==LifecycleState::stopped)return {};if(lifecycle_.state()!=LifecycleState::running)return failure(ErrorCode::invalid_state,"stop requires running");lifecycle_.apply(LifecycleEvent::stop);idle_.wait(lock,[this]{return in_flight_==0;});lock.unlock();auto r=run_hook(hooks_.on_stop);lock.lock();lifecycle_.apply(r.ok()?LifecycleEvent::stopped:LifecycleEvent::stop_failed);lock.unlock();idle_.notify_all();return r;}
  Result<void> restart(){auto s=status();if(s==LifecycleState::running){auto r=stop();if(!r.ok())return r;}return start();}
- Result<void> dispose(){std::unique_lock<std::mutex> lock(mutex_);if(disposed_)return {};bool running=lifecycle_.state()==LifecycleState::running;lock.unlock();std::optional<Error> first;if(running){auto stopped=stop();if(!stopped.ok())first=stopped.error();}lock.lock();if(disposed_)return first?Result<void>(*first):Result<void>();idle_.wait(lock,[this]{return in_flight_==0;});disposed_=true;lock.unlock();auto r=run_hook(hooks_.on_dispose);lock.lock();operations_.clear();lock.unlock();events_.clear();state_.clear();if(first)return *first;return r;}
+ // Serialize terminal disposal and wait for transitions/in-flight calls to finish.
+ Result<void> dispose(){
+  std::unique_lock<std::mutex> lock(mutex_);
+  if(disposed_)return {};
+  if(disposing_){idle_.wait(lock,[this]{return disposed_;});return {};}
+  disposing_=true;
+  idle_.wait(lock,[this]{
+   const auto s=lifecycle_.state();
+   return s!=LifecycleState::initializing && s!=LifecycleState::starting && s!=LifecycleState::stopping;
+  });
+  const bool running=lifecycle_.state()==LifecycleState::running;
+  lock.unlock();
+  std::optional<Error> first;
+  if(running){auto stopped=stop();if(!stopped.ok())first=stopped.error();}
+  lock.lock();idle_.wait(lock,[this]{return in_flight_==0;});lock.unlock();
+  auto hook=run_hook(hooks_.on_dispose);
+  events_.clear();state_.clear();
+  lock.lock();operations_.clear();disposed_=true;disposing_=false;lock.unlock();
+  idle_.notify_all();
+  return first?Result<void>(*first):hook;
+ }
  template<class In,class Out,class Fn>
  Result<void> add_operation(OperationInfo info,Fn handler,std::function<bool(const In&)> check_in={},std::function<bool(const Out&)> check_out={}){
   static_assert(!std::is_void<In>::value&&!std::is_void<Out>::value,"use concrete contract types");
   if(info.name.empty())return failure(ErrorCode::invalid_argument,"operation name required");
+  auto caps=validate_labels(info.capabilities,false);if(!caps.ok())return caps;
+  auto protocols=validate_labels(info.protocols,true);if(!protocols.ok())return protocols;
   info.input=typeid(In);info.output=typeid(Out);
   Handler erase=[fn=std::move(handler),check_in=std::move(check_in),check_out=std::move(check_out)](const std::any& input,const InvocationContext& ctx,Cancellation cancellation)->Result<std::any>{
    auto ptr=std::any_cast<In>(&input);if(!ptr)return failure(ErrorCode::type_mismatch,"input contract type mismatch");
@@ -132,21 +170,32 @@ class Service {
    try{Result<Out> r=fn(*ptr,ctx,cancellation);if(!r.ok())return r.error();if(check_out&&!check_out(r.value()))return failure(ErrorCode::invalid_argument,"output validation failed");return std::any(r.value());}
    catch(const std::exception& e){return failure(ErrorCode::exception,e.what());}catch(...){return failure(ErrorCode::exception,"operation threw");}
   };
-  std::lock_guard<std::mutex> lock(mutex_);if(disposed_)return failure(ErrorCode::disposed,"service disposed");if(operations_.count(info.name))return failure(ErrorCode::duplicate,"operation already registered");auto key=info.name;operations_.emplace(std::move(key),Operation{std::move(info),std::move(erase)});return {};
+  std::lock_guard<std::mutex> lock(mutex_);if(disposed_||disposing_)return failure(ErrorCode::disposed,"service disposed");if(operations_.count(info.name))return failure(ErrorCode::duplicate,"operation already registered");auto key=info.name;operations_.emplace(std::move(key),Operation{std::move(info),std::move(erase)});return {};
  }
  std::vector<OperationInfo> operations()const{std::lock_guard<std::mutex> lock(mutex_);std::vector<OperationInfo> out;for(auto& op:operations_)out.push_back(op.second.info);return out;}
  Result<std::any> call(const std::string& name,const std::any& input,InvocationContext ctx={},Cancellation cancellation={}){
   Handler handler;std::uint64_t id=++sequence_;
   {std::lock_guard<std::mutex> lock(mutex_);
-   if(disposed_)return failure(ErrorCode::disposed,"service disposed");
+   if(disposed_||disposing_)return failure(ErrorCode::disposed,"service disposed");
    if(lifecycle_.state()!=LifecycleState::running)return failure(ErrorCode::invalid_state,"service is not running");
    auto it=operations_.find(name);if(it==operations_.end())return failure(ErrorCode::not_found,"operation not found");handler=it->second.handler;++in_flight_;
   }
+  // Even if telemetry allocation or event delivery throws, the in-flight
+  // reservation is always released before stop/dispose can wait on it.
+  struct Completion {
+   Service& service;
+   ~Completion(){
+    {std::lock_guard<std::mutex> lock(service.mutex_);--service.in_flight_;}
+    service.idle_.notify_all();
+   }
+  } completion{*this};
   Result<std::any> r=failure(ErrorCode::exception,"unexpected invocation exception");
   try{r=handler(input,ctx,cancellation);}catch(const std::exception& e){r=failure(ErrorCode::exception,e.what());}catch(...){r=failure(ErrorCode::exception,"unknown invocation exception");}
-  traces_.add({id,info_.id,name,ctx.correlation_id,r.ok(),r.ok()?ErrorCode::exception:r.error().code});
-  events_.emit(name+(r.ok()?":completed":":failed"),std::any(ctx.correlation_id));
-  {std::lock_guard<std::mutex> lock(mutex_);--in_flight_;}idle_.notify_all();return r;
+  try{
+   traces_.add({id,info_.id,name,ctx.correlation_id,r.ok(),r.ok()?ErrorCode::exception:r.error().code});
+   events_.emit(name+(r.ok()?":completed":":failed"),std::any(ctx.correlation_id));
+  }catch(...){ /* telemetry is best-effort; never block lifecycle teardown */ }
+  return r;
  }
  template<class In,class Out> Result<Out> invoke(const std::string& name,const In& input,InvocationContext ctx={},Cancellation cancel={}){
   auto r=call(name,std::any(input),std::move(ctx),cancel);if(!r.ok())return r.error();if(auto out=std::any_cast<Out>(&r.value()))return *out;return failure(ErrorCode::type_mismatch,"output contract type mismatch");

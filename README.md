@@ -31,3 +31,23 @@ cmake --build consumer/build && consumer/build/consumer
 ```
 
 `docs/upstream-parity.md` identifies implemented behavior and documented remaining gaps; **this is not yet full KrnlTS parity**. The base header does not require GutCPP; `include/krnl/gutcpp_adapter.hpp` is optional and targets the pinned `gut/result.hpp` contract. The portable core does not own threads, networking, filesystem or clock integrations; it depends on C++17 `std::mutex`, `std::any`, and exceptions, so freestanding/bare-metal without those features requires an adapter or reduced profile.
+
+## Managed host-driven jobs (Wave 2 closure)
+
+`#include <krnl/job_queue.hpp>` exposes `JobQueue`, `JobPolicy`, `JobHandle` and `JobStatus`. The host enqueues jobs and calls `pump_one(now_ms)` on its own workers with **monotonic milliseconds**; KrnlCPP never launches threads or sleeps. Queue capacity, active-concurrency limits, priority (higher first, FIFO ties), retryable-error backoff (fixed/exponential), pending queue deadlines, cancellation and terminal result handles are deterministic. `close()` cancels pending/active jobs cooperatively; the destructor drains active pump calls. `JobHandle::result_as<T>()` returns structured type errors and may block until the host pumps a job. Retain the handle for the duration of interest. Never destroy a queue from within one of its active handler callbacks.
+
+```cpp
+#include <krnl/job_queue.hpp>
+krnl::JobQueue jobs(8, 2); // eight waiting, two concurrent host pumps
+krnl::JobPolicy policy{5, 2, 10, true, 1000};
+auto handle = jobs.enqueue([](krnl::Cancellation cancelled) -> krnl::Result<std::any> {
+  if (cancelled.cancelled()) return krnl::failure(krnl::ErrorCode::cancelled, "aborted");
+  return std::any(42);
+}, policy, 100); // host monotonic timestamp in milliseconds
+if (handle.ok()) {
+  jobs.pump_one(100);
+  auto answer = handle.value().result_as<int>(); // 42
+}
+```
+
+A deadline covers queued/runnable jobs when the host calls `pump_one`. In-flight functions must cooperate with cancellation, as arbitrary C++ callbacks cannot be safely forcibly terminated. Service disposal serializes concurrent callers and waits for in-flight execution and transitional hooks. Optional `GutCPP` adapter remains at the existing pinned read-only boundary.
