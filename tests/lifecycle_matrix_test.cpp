@@ -40,7 +40,6 @@ int main() {
   assert(matrix_is_correct());
   for (std::size_t i = 0; i < states.size(); ++i) {
     for (std::size_t j = 0; j < events.size(); ++j) {
-      Lifecycle instance;
       // The transition function is pure: rejected events must leave output unchanged.
       auto sentinel = LifecycleState::ready;
       const bool accepted = try_transition(states[i], events[j], sentinel);
