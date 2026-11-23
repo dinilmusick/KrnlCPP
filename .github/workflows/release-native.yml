@@ -1,0 +1,39 @@
+name: Verified native source release
+on:
+  workflow_run:
+    workflows: ["C++ lifecycle portability"]
+    types: [completed]
+permissions:
+  contents: read
+jobs:
+  release:
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_branch == 'main' &&
+          github.event.workflow_run.head_repository.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require successful CI for exact current main
+        env:
+          VERIFIED_HEAD: ${{ github.event.workflow_run.head_sha }}
+        run: test "$(git rev-parse HEAD)" = "$VERIFIED_HEAD"
+      - name: Check CMake build/install with packaged version
+        run: |
+          set -euo pipefail
+          cmake -S . -B "${RUNNER_TEMP}/release-build" -DBUILD_TESTING=OFF
+          cmake --build "${RUNNER_TEMP}/release-build" --parallel 2
+          cmake --install "${RUNNER_TEMP}/release-build" --prefix "${RUNNER_TEMP}/release-install"
+      - name: Prepare semantic version PR or tagged source release
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
