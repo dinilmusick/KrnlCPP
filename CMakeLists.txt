@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
-project(KrnlCpp VERSION 0.3.0 LANGUAGES CXX)
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/version.txt" ULTRST_RELEASE_VERSION LIMIT_COUNT 1)
+project(KrnlCpp VERSION ${ULTRST_RELEASE_VERSION} LANGUAGES CXX)
 add_library(krnlcpp INTERFACE)
 target_include_directories(krnlcpp INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
 target_compile_features(krnlcpp INTERFACE cxx_std_17)
